@@ -11,7 +11,7 @@ import requests
 from requests.auth import HTTPBasicAuth
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(override=True)
 
 CONFLUENCE_BASE_URL = os.getenv("CONFLUENCE_BASE_URL", "").rstrip("/")
 CONFLUENCE_USERNAME = os.getenv("CONFLUENCE_USERNAME", "")
@@ -234,7 +234,8 @@ def download_page_as_pdf(session, page_id: str, output_path: str) -> bool:
 
 
 def _process_page(session, page_id: str, page_title: str, space_name: str,
-                   last_modified: str, visited: set = None) -> list:
+                   last_modified: str, visited: set = None,
+                   space_key: str = "", space_id: int = 0) -> list:
     """处理单个页面：下载自己 + 递归下载子页面。返回列表。"""
     if visited is None:
         visited = set()
@@ -255,6 +256,8 @@ def _process_page(session, page_id: str, page_title: str, space_name: str,
         "page_id": page_id,
         "title": page_title,
         "space": space_name,
+        "space_key": space_key,
+        "space_id": space_id,
         "last_modified": last_modified,
         "dir": page_dir,
         "pdf_path": "",
@@ -314,11 +317,13 @@ def _process_page(session, page_id: str, page_title: str, space_name: str,
                     continue
                 child_title = child.get("title", "N/A")
                 child_space = child.get("space", {}).get("name", space_name)
+                child_space_key = child.get("space", {}).get("key", space_key)
+                child_space_id = child.get("space", {}).get("id", space_id)
                 child_modified = child.get("version", {}).get("when", "")
                 print()
                 child_results = _process_page(
                     session, child_id, child_title, child_space,
-                    child_modified, visited
+                    child_modified, visited, child_space_key, child_space_id
                 )
                 results.extend(child_results)
     except Exception as e:
@@ -413,10 +418,142 @@ def download_single_page(page_input: str) -> list:
 
     print(f"[INFO] 找到页面: {page_title} (ID: {page_id})\n")
 
+    space_key = page_info.get("space", {}).get("key", "")
+    space_id = page_info.get("space", {}).get("id", 0)
     visited = set()
-    results = _process_page(session, page_id, page_title, space_name, last_modified, visited)
+    results = _process_page(session, page_id, page_title, space_name,
+                            last_modified, visited, space_key, space_id)
     print()
     _print_summary(results)
     return results
 
 
+def get_latest_pages(limit: int = 50) -> list:
+    """
+    获取 Confluence 中最近修改的页面（仅 current 状态），按 lastModified 倒序。
+
+    参数:
+        limit: 最大返回数量，默认 50
+
+    返回:
+        list of dict，每个包含:
+          - id: 页面 ID
+          - title: 页面标题
+          - status: "current"
+          - space_key: Space Key
+          - space_id: Space ID
+          - space_name: Space 名称
+          - last_modified: 最后修改时间
+    """
+    if not all([CONFLUENCE_BASE_URL, CONFLUENCE_USERNAME, CONFLUENCE_PASSWORD]):
+        raise ValueError("请在 .env 文件中填写完整的 Confluence 配置信息")
+
+    session = get_session()
+
+    # CQL: 按 lastModified 倒序获取最近的页面
+    cql = 'type=page order by lastModified desc'
+
+    url = f"{CONFLUENCE_BASE_URL}/rest/api/content/search"
+    all_pages = []
+    start = 0
+
+    while len(all_pages) < limit:
+        params = {
+            "cql": cql,
+            "limit": min(limit - len(all_pages), 100),
+            "start": start,
+            "expand": "version,space",
+        }
+        resp = session.get(url, params=params)
+        resp.raise_for_status()
+        data = resp.json()
+        results = data.get("results", [])
+
+        for page in results:
+            page_info = {
+                "id": page["id"],
+                "title": page.get("title", ""),
+                "status": page.get("status", "current"),
+                "space_key": page.get("space", {}).get("key", ""),
+                "space_id": page.get("space", {}).get("id", 0),
+                "space_name": page.get("space", {}).get("name", ""),
+                "last_modified": page.get("version", {}).get("when", ""),
+            }
+            all_pages.append(page_info)
+
+        if data.get("_links", {}).get("next") and len(all_pages) < limit:
+            start += len(results)
+        else:
+            break
+
+    print(f"[查询] 获取最近修改的 {len(all_pages)} 个页面")
+    return all_pages
+
+
+def get_recently_changed_pages(since: str, limit: int = 100) -> list:
+    """
+    获取自指定时间以来所有变更的页面（包括已删除到回收站的）。
+    
+    参数:
+        since: 起始时间，格式 "yyyy-MM-dd HH:mm"
+        limit: 最大返回数量
+    
+    返回:
+        list of dict，每个包含:
+          - id: 页面 ID
+          - title: 页面标题
+          - status: "current" 或 "trashed"
+          - space_key: Space Key
+          - space_id: Space ID
+          - space_name: Space 名称
+          - last_modified: 最后修改时间
+    """
+    if not all([CONFLUENCE_BASE_URL, CONFLUENCE_USERNAME, CONFLUENCE_PASSWORD]):
+        raise ValueError("请在 .env 文件中填写完整的 Confluence 配置信息")
+
+    session = get_session()
+
+    # Confluence CQL: 查询指定时间之后修改的所有页面（含 current 和 trashed）
+    # 将时间转换为 Confluence 格式
+    since_clean = since.strip()
+    cql = f'type=page AND lastModified >= "{since_clean}" order by lastModified desc'
+
+    url = f"{CONFLUENCE_BASE_URL}/rest/api/content/search"
+    all_pages = []
+    start = 0
+
+    while True:
+        params = {
+            "cql": cql,
+            "limit": min(limit - len(all_pages), 100),
+            "start": start,
+            "expand": "version,space",
+        }
+        resp = session.get(url, params=params)
+        resp.raise_for_status()
+        data = resp.json()
+        results = data.get("results", [])
+
+        for page in results:
+            page_info = {
+                "id": page["id"],
+                "title": page.get("title", ""),
+                "status": page.get("status", "current"),
+                "space_key": page.get("space", {}).get("key", ""),
+                "space_id": page.get("space", {}).get("id", 0),
+                "space_name": page.get("space", {}).get("name", ""),
+                "last_modified": page.get("version", {}).get("when", ""),
+            }
+            all_pages.append(page_info)
+
+        if data.get("_links", {}).get("next") and len(all_pages) < limit:
+            start += len(results)
+        else:
+            break
+
+    print(f"[查询] 自 {since} 以来共 {len(all_pages)} 个页面发生变更")
+    current_count = sum(1 for p in all_pages if p["status"] == "current")
+    trashed_count = sum(1 for p in all_pages if p["status"] == "trashed")
+    print(f"  - 活跃: {current_count}, 已删除: {trashed_count}")
+
+    return all_pages
