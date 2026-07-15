@@ -14,7 +14,6 @@ load_dotenv()
 CONFLUENCE_BASE_URL = os.getenv("CONFLUENCE_BASE_URL", "").rstrip("/")
 CONFLUENCE_USERNAME = os.getenv("CONFLUENCE_USERNAME", "")
 CONFLUENCE_PASSWORD = os.getenv("CONFLUENCE_PASSWORD", "")
-CONFLUENCE_SPACE_KEY = os.getenv("CONFLUENCE_SPACE_KEY", "")
 
 DOWNLOAD_DIR = os.path.join(os.path.dirname(__file__), "downloads")
 
@@ -27,12 +26,12 @@ def get_session():
     return session
 
 
-def get_recently_updated_pages(session, space_key: str, limit: int = 3) -> list:
+def get_recently_updated_pages(session, limit: int = 3) -> list:
     """
-    通过 CQL 查询获取指定 space 下最近更新的页面
+    通过 CQL 查询获取所有 space 下最近更新的页面（不限定 space）
     使用 /rest/api/content/search 接口
     """
-    cql = f'space="{space_key}" AND type=page ORDER BY lastmodified DESC'
+    cql = 'type=page ORDER BY lastmodified DESC'
     url = f"{CONFLUENCE_BASE_URL}/rest/api/content/search"
     params = {
         "cql": cql,
@@ -111,13 +110,13 @@ def crawl_recent_pages(limit: int = 3) -> list:
     """
     主爬取流程：获取最近更新的 limit 条页面，下载附件，返回结构化数据
     """
-    if not all([CONFLUENCE_BASE_URL, CONFLUENCE_USERNAME, CONFLUENCE_PASSWORD, CONFLUENCE_SPACE_KEY]):
+    if not all([CONFLUENCE_BASE_URL, CONFLUENCE_USERNAME, CONFLUENCE_PASSWORD]):
         raise ValueError("请在 .env 文件中填写完整的 Confluence 配置信息")
 
     session = get_session()
-    print(f"[INFO] 正在从 Confluence Space '{CONFLUENCE_SPACE_KEY}' 获取最近 {limit} 条更新的页面...")
+    print(f"[INFO] 正在从 Confluence 获取所有 Space 下最近 {limit} 条更新的页面...")
 
-    pages = get_recently_updated_pages(session, CONFLUENCE_SPACE_KEY, limit)
+    pages = get_recently_updated_pages(session, limit)
     print(f"[INFO] 找到 {len(pages)} 个页面\n")
 
     results = []
