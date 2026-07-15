@@ -33,4 +33,6 @@ Thumbs.db
 downloads/
 
 # Crawl results
+*.pdf
+*.html
 crawl_result.json
