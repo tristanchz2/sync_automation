@@ -194,17 +194,22 @@ def crawl_and_download(limit: int = 3) -> list:
         print(f"  修改时间: {last_modified}")
 
         safe_title = safe_filename(page_title)
+        # 每个页面一个文件夹，PDF 和附件都放在里面
+        page_dir = os.path.join(OUTPUT_DIR, "downloads", safe_title)
+        os.makedirs(page_dir, exist_ok=True)
+
         page_result = {
             "page_id": page_id,
             "title": page_title,
             "space": space_name,
             "last_modified": last_modified,
+            "dir": page_dir,
             "pdf_path": "",
             "attachments": [],
         }
 
-        # 1. 导出 PDF
-        pdf_path = os.path.join(OUTPUT_DIR, f"{safe_title}.pdf")
+        # 1. 导出 PDF 到页面文件夹
+        pdf_path = os.path.join(page_dir, f"{safe_title}.pdf")
         try:
             success = download_page_as_pdf(session, page_id, pdf_path)
             if success:
@@ -214,16 +219,13 @@ def crawl_and_download(limit: int = 3) -> list:
         except Exception as e:
             print(f"  [PDF] 导出失败: {e}")
 
-        # 2. 获取页面详情，识别附件
+        # 2. 获取页面详情，识别并下载附件到同一文件夹
         try:
             page_data = get_page_detail(session, page_id)
             attachments = get_downloadable_attachments(page_data)
 
             if attachments:
                 print(f"  [附件] 发现 {len(attachments)} 个可下载文件:")
-                # 创建附件目录
-                att_dir = os.path.join(OUTPUT_DIR, "downloads", safe_title)
-                os.makedirs(att_dir, exist_ok=True)
 
                 for att in attachments:
                     filename = att["filename"]
@@ -231,7 +233,7 @@ def crawl_and_download(limit: int = 3) -> list:
                     print(f"    - {filename} ({size_kb:.0f} KB)")
 
                     try:
-                        local_path = download_attachment(session, page_id, att, att_dir)
+                        local_path = download_attachment(session, page_id, att, page_dir)
                         if local_path:
                             page_result["attachments"].append({
                                 "filename": filename,
@@ -255,13 +257,11 @@ def crawl_and_download(limit: int = 3) -> list:
     print("=" * 60)
     print("  下载汇总:")
     for r in results:
-        print(f"\n  页面: {r['title']}")
+        print(f"\n  [DIR] {r['dir']}")
         if r['pdf_path']:
-            print(f"    PDF: {r['pdf_path']}")
-        if r['attachments']:
-            print(f"    附件 ({len(r['attachments'])} 个):")
-            for a in r['attachments']:
-                print(f"      - {a['filename']} ({a['size']:,} bytes)")
+            print(f"    [PDF] {os.path.basename(r['pdf_path'])}")
+        for a in r['attachments']:
+            print(f"    [ATT] {a['filename']} ({a['size']:,} bytes)")
     print("=" * 60)
 
     return results
