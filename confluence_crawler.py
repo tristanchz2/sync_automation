@@ -42,19 +42,6 @@ def get_session():
     return session
 
 
-def get_recently_updated_pages(session, limit: int = 3) -> list:
-    """通过 CQL 查询获取所有 space 下最近更新的页面"""
-    cql = 'type=page ORDER BY lastmodified DESC'
-    url = f"{CONFLUENCE_BASE_URL}/rest/api/content/search"
-    params = {
-        "cql": cql,
-        "limit": limit,
-        "expand": "version,space,ancestors",
-    }
-    resp = session.get(url, params=params)
-    resp.raise_for_status()
-    return resp.json().get("results", [])
-
 
 def get_page_detail(session, page_id: str) -> dict:
     """获取页面完整内容，包括附件列表和正文"""
@@ -63,6 +50,26 @@ def get_page_detail(session, page_id: str) -> dict:
     resp = session.get(url, params=params)
     resp.raise_for_status()
     return resp.json()
+
+
+def get_child_pages(session, page_id: str) -> list:
+    """获取页面的所有直接子页面"""
+    url = f"{CONFLUENCE_BASE_URL}/rest/api/content/{page_id}/child/page"
+    params = {"expand": "version,space", "limit": 100}
+    all_children = []
+    start = 0
+    while True:
+        params["start"] = start
+        resp = session.get(url, params=params)
+        resp.raise_for_status()
+        data = resp.json()
+        results = data.get("results", [])
+        all_children.extend(results)
+        if data.get("_links", {}).get("next"):
+            start += len(results)
+        else:
+            break
+    return all_children
 
 
 def get_downloadable_attachments(page_data: dict) -> list:
@@ -112,6 +119,67 @@ def get_downloadable_attachments(page_data: dict) -> list:
                     })
 
     return attachments
+
+
+def get_linked_page_ids(session, page_data: dict) -> list:
+    """从页面正文中提取链接的其他 Confluence 页面 ID"""
+    body = page_data.get("body", {}).get("storage", {}).get("value", "")
+    if not body:
+        return []
+
+    linked_ids = []
+
+    # 1. <ri:page ri:content-id="12345" /> 直接引用页面 ID
+    for pid in re.findall(r'<ri:page[^>]*ri:content-id="(\d+)"', body):
+        if pid not in linked_ids:
+            linked_ids.append(pid)
+
+    # 2. <ri:page ri:content-title="xxx" ri:space-key="yyy" /> 按标题+空间引用
+    for m in re.finditer(r'<ri:page[^>]*ri:content-title="([^"]+)"[^>]*?(?:ri:space-key="([^"]*)")?', body):
+        title = m.group(1)
+        space_key = m.group(2) or ""
+        # 通过 API 查找页面 ID
+        params = {"title": title, "limit": 1}
+        if space_key:
+            params["spaceKey"] = space_key
+        try:
+            r = session.get(f"{CONFLUENCE_BASE_URL}/rest/api/content", params=params)
+            if r.status_code == 200:
+                results = r.json().get("results", [])
+                if results:
+                    pid = results[0]["id"]
+                    if pid not in linked_ids:
+                        linked_ids.append(pid)
+        except Exception:
+            pass
+
+    # 3. 普通 href 链接指向本站页面: /display/xxx/yyy 或 /spaces/xxx/pages/12345
+    base_host = re.match(r'(https?://[^/]+)', CONFLUENCE_BASE_URL)
+    if base_host:
+        host_pattern = re.escape(base_host.group(1))
+        for m in re.finditer(rf'href="{host_pattern}/display/([^/]+)/([^"#?]+)"', body):
+            space_key = m.group(1)
+            title = m.group(2).replace('+', ' ')
+            from urllib.parse import unquote
+            title = unquote(title)
+            try:
+                r = session.get(f"{CONFLUENCE_BASE_URL}/rest/api/content",
+                                params={"title": title, "spaceKey": space_key, "limit": 1})
+                if r.status_code == 200:
+                    results = r.json().get("results", [])
+                    if results:
+                        pid = results[0]["id"]
+                        if pid not in linked_ids:
+                            linked_ids.append(pid)
+            except Exception:
+                pass
+
+        for m in re.finditer(rf'href="{host_pattern}/spaces/([^/]+)/pages/(\d+)"', body):
+            pid = m.group(2)
+            if pid not in linked_ids:
+                linked_ids.append(pid)
+
+    return linked_ids
 
 
 def download_attachment(session, page_id: str, attachment: dict, output_dir: str) -> str:
@@ -165,97 +233,107 @@ def download_page_as_pdf(session, page_id: str, output_path: str) -> bool:
     return True
 
 
-def crawl_and_download(limit: int = 3) -> list:
-    """
-    主流程：爬取最近更新的页面
-    1. 导出页面为 PDF
-    2. 识别并下载页面中的附件（PPT/Excel/Word 等）
-    返回结果列表
-    """
-    if not all([CONFLUENCE_BASE_URL, CONFLUENCE_USERNAME, CONFLUENCE_PASSWORD]):
-        raise ValueError("请在 .env 文件中填写完整的 Confluence 配置信息")
+def _process_page(session, page_id: str, page_title: str, space_name: str,
+                   last_modified: str, visited: set = None) -> list:
+    """处理单个页面：下载自己 + 递归下载子页面。返回列表。"""
+    if visited is None:
+        visited = set()
 
-    session = get_session()
-    print(f"[INFO] 正在从 Confluence 获取所有 Space 下最近 {limit} 条更新的页面...")
+    if page_id in visited:
+        return []
+    visited.add(page_id)
 
-    pages_summary = get_recently_updated_pages(session, limit)
-    print(f"[INFO] 找到 {len(pages_summary)} 个页面\n")
+    print(f"处理页面: {page_title}")
+    print(f"  空间: {space_name}")
+    print(f"  修改时间: {last_modified}")
 
-    results = []
+    safe_title = safe_filename(page_title)
+    page_dir = os.path.join(OUTPUT_DIR, "downloads", safe_title)
+    os.makedirs(page_dir, exist_ok=True)
 
-    for i, page_summary in enumerate(pages_summary, 1):
-        page_id = page_summary["id"]
-        page_title = page_summary.get("title", "N/A")
-        space_name = page_summary.get("space", {}).get("name", "未知空间")
-        last_modified = page_summary.get("version", {}).get("when", "")
+    page_result = {
+        "page_id": page_id,
+        "title": page_title,
+        "space": space_name,
+        "last_modified": last_modified,
+        "dir": page_dir,
+        "pdf_path": "",
+        "attachments": [],
+    }
 
-        print(f"[{i}/{len(pages_summary)}] 处理页面: {page_title}")
-        print(f"  空间: {space_name}")
-        print(f"  修改时间: {last_modified}")
+    # 1. 导出 PDF
+    pdf_path = os.path.join(page_dir, f"{safe_title}.pdf")
+    try:
+        success = download_page_as_pdf(session, page_id, pdf_path)
+        if success:
+            size = os.path.getsize(pdf_path)
+            print(f"  [PDF] 已导出 ({size:,} bytes)")
+            page_result["pdf_path"] = pdf_path
+    except Exception as e:
+        print(f"  [PDF] 导出失败: {e}")
 
-        safe_title = safe_filename(page_title)
-        # 每个页面一个文件夹，PDF 和附件都放在里面
-        page_dir = os.path.join(OUTPUT_DIR, "downloads", safe_title)
-        os.makedirs(page_dir, exist_ok=True)
+    # 2. 识别并下载附件
+    try:
+        page_data = get_page_detail(session, page_id)
+        attachments = get_downloadable_attachments(page_data)
 
-        page_result = {
-            "page_id": page_id,
-            "title": page_title,
-            "space": space_name,
-            "last_modified": last_modified,
-            "dir": page_dir,
-            "pdf_path": "",
-            "attachments": [],
-        }
+        if attachments:
+            print(f"  [附件] 发现 {len(attachments)} 个可下载文件:")
+            for att in attachments:
+                filename = att["filename"]
+                size_kb = att["size"] / 1024 if att["size"] else 0
+                print(f"    - {filename} ({size_kb:.0f} KB)")
+                try:
+                    local_path = download_attachment(session, page_id, att, page_dir)
+                    if local_path:
+                        page_result["attachments"].append({
+                            "filename": filename,
+                            "local_path": local_path,
+                            "size": os.path.getsize(local_path),
+                        })
+                        print(f"      [已下载]")
+                    else:
+                        print(f"      [下载失败: 无法获取下载链接]")
+                except Exception as e:
+                    print(f"      [下载失败: {e}]")
+        else:
+            print(f"  [附件] 无需要下载的附件")
+    except Exception as e:
+        print(f"  [附件] 获取附件列表失败: {e}")
 
-        # 1. 导出 PDF 到页面文件夹
-        pdf_path = os.path.join(page_dir, f"{safe_title}.pdf")
-        try:
-            success = download_page_as_pdf(session, page_id, pdf_path)
-            if success:
-                size = os.path.getsize(pdf_path)
-                print(f"  [PDF] 已导出 ({size:,} bytes)")
-                page_result["pdf_path"] = pdf_path
-        except Exception as e:
-            print(f"  [PDF] 导出失败: {e}")
+    results = [page_result]
 
-        # 2. 获取页面详情，识别并下载附件到同一文件夹
-        try:
-            page_data = get_page_detail(session, page_id)
-            attachments = get_downloadable_attachments(page_data)
+    # 3. 递归下载子页面
+    try:
+        child_pages = get_child_pages(session, page_id)
+        if child_pages:
+            print(f"  [子页面] 发现 {len(child_pages)} 个子页面，递归下载...")
+            for child in child_pages:
+                child_id = child["id"]
+                if child_id in visited:
+                    continue
+                child_title = child.get("title", "N/A")
+                child_space = child.get("space", {}).get("name", space_name)
+                child_modified = child.get("version", {}).get("when", "")
+                print()
+                child_results = _process_page(
+                    session, child_id, child_title, child_space,
+                    child_modified, visited
+                )
+                results.extend(child_results)
+    except Exception as e:
+        print(f"  [子页面] 获取子页面失败: {e}")
 
-            if attachments:
-                print(f"  [附件] 发现 {len(attachments)} 个可下载文件:")
+    return results
 
-                for att in attachments:
-                    filename = att["filename"]
-                    size_kb = att["size"] / 1024 if att["size"] else 0
-                    print(f"    - {filename} ({size_kb:.0f} KB)")
 
-                    try:
-                        local_path = download_attachment(session, page_id, att, page_dir)
-                        if local_path:
-                            page_result["attachments"].append({
-                                "filename": filename,
-                                "local_path": local_path,
-                                "size": os.path.getsize(local_path),
-                            })
-                            print(f"      [已下载]")
-                        else:
-                            print(f"      [下载失败: 无法获取下载链接]")
-                    except Exception as e:
-                        print(f"      [下载失败: {e}]")
-            else:
-                print(f"  [附件] 无需要下载的附件")
-        except Exception as e:
-            print(f"  [附件] 获取附件列表失败: {e}")
+def _print_summary(results: list):
+    """打印下载汇总"""
+    total_att = sum(len(r['attachments']) for r in results)
+    total_pdf = sum(1 for r in results if r['pdf_path'])
 
-        results.append(page_result)
-        print()
-
-    # 打印汇总
     print("=" * 60)
-    print("  下载汇总:")
+    print(f"  下载汇总: {len(results)} 个页面, {total_pdf} 个 PDF, {total_att} 个附件")
     for r in results:
         print(f"\n  [DIR] {r['dir']}")
         if r['pdf_path']:
@@ -264,4 +342,81 @@ def crawl_and_download(limit: int = 3) -> list:
             print(f"    [ATT] {a['filename']} ({a['size']:,} bytes)")
     print("=" * 60)
 
+
+def resolve_page(session, page_input: str) -> dict:
+    """
+    解析用户输入的页面标识，返回页面摘要信息
+    支持:
+      - 纯数字: 作为 page ID
+      - URL: 如 https://finkms.kingdee.com/display/KJBQT/2024-H1
+             或 https://finkms.kingdee.com/spaces/KJBQT/pages/69654995/2024-H1
+    """
+    page_input = page_input.strip()
+
+    # URL 格式1: /display/{spaceKey}/{title}
+    m = re.search(r'/display/([^/]+)/([^?#]+)', page_input)
+    if m:
+        space_key = m.group(1)
+        title = m.group(2).replace('+', ' ')
+        from urllib.parse import unquote
+        title = unquote(title)
+        r = session.get(f"{CONFLUENCE_BASE_URL}/rest/api/content",
+                        params={"title": title, "spaceKey": space_key, "expand": "version,space"})
+        r.raise_for_status()
+        results = r.json().get("results", [])
+        if results:
+            return results[0]
+        raise ValueError(f"未找到页面: space={space_key}, title={title}")
+
+    # URL 格式2: /spaces/{spaceKey}/pages/{pageId}[/{title}]
+    m = re.search(r'/spaces/([^/]+)/pages/(\d+)', page_input)
+    if m:
+        page_id = m.group(2)
+        r = session.get(f"{CONFLUENCE_BASE_URL}/rest/api/content/{page_id}",
+                        params={"expand": "version,space"})
+        r.raise_for_status()
+        data = r.json()
+        return {
+            "id": data["id"],
+            "title": data.get("title", ""),
+            "space": data.get("space", {}),
+            "version": data.get("version", {}),
+        }
+
+    # 提取输入中的数字部分作为 page ID（兼容 ID 中夹杂非数字字符的情况）
+    digits = re.sub(r'\D', '', page_input)
+    if digits:
+        r = session.get(f"{CONFLUENCE_BASE_URL}/rest/api/content/{digits}",
+                        params={"expand": "version,space"})
+        if r.status_code == 200:
+            data = r.json()
+            if data.get("id"):
+                return data
+
+    raise ValueError(f"无法解析页面标识: {page_input}\n"
+                     f"  支持格式: 页面ID(如 69654995) 或 URL(如 https://.../display/KJBQT/2024-H1)")
+
+
+def download_single_page(page_input: str) -> list:
+    """下载指定的单个页面"""
+    if not all([CONFLUENCE_BASE_URL, CONFLUENCE_USERNAME, CONFLUENCE_PASSWORD]):
+        raise ValueError("请在 .env 文件中填写完整的 Confluence 配置信息")
+
+    session = get_session()
+    print(f"[INFO] 解析页面标识: {page_input}")
+
+    page_info = resolve_page(session, page_input)
+    page_id = page_info["id"]
+    page_title = page_info.get("title", "N/A")
+    space_name = page_info.get("space", {}).get("name", "未知空间")
+    last_modified = page_info.get("version", {}).get("when", "")
+
+    print(f"[INFO] 找到页面: {page_title} (ID: {page_id})\n")
+
+    visited = set()
+    results = _process_page(session, page_id, page_title, space_name, last_modified, visited)
+    print()
+    _print_summary(results)
     return results
+
+

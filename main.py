@@ -1,22 +1,41 @@
 """
 主入口脚本
-从 Confluence 爬取最近更新的 3 条页面，导出 PDF 并下载附件
+用法:
+  python main.py -p <页面ID或URL>    # 爬取指定页面
 """
 
 import sys
-from confluence_crawler import crawl_and_download
+import argparse
+from confluence_crawler import download_single_page
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Confluence 爬虫 - 导出 PDF 并下载附件"
+    )
+    parser.add_argument(
+        "-p", "--page",
+        type=str,
+        required=True,
+        help="指定页面（页面 ID 或 URL）"
+    )
+    return parser.parse_args()
 
 
 def main():
+    args = parse_args()
+
     print("=" * 60)
     print("  Confluence 爬虫工具")
     print("  - 导出页面为 PDF")
     print("  - 下载页面中的附件（PPT/Excel/Word 等）")
+    print("  - 下载页面中链接的其他页面")
     print("=" * 60)
     print()
 
     try:
-        results = crawl_and_download(limit=3)
+        print(f"[页面] {args.page}\n")
+        results = download_single_page(args.page)
     except Exception as e:
         print(f"[ERROR] 爬取失败: {e}")
         sys.exit(1)
