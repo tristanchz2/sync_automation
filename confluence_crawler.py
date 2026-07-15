@@ -19,13 +19,10 @@ CONFLUENCE_PASSWORD = os.getenv("CONFLUENCE_PASSWORD", "")
 
 OUTPUT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# 需要下载的文件扩展名（PDF 除外，因为 PDF 已通过页面导出获取）
-DOWNLOADABLE_EXTENSIONS = {
-    '.pptx', '.ppt', '.xlsx', '.xls', '.docx', '.doc',
-    '.zip', '.rar', '.7z',
-    '.mp4', '.avi', '.mov',
-    '.vsd', '.vsdx',  # Visio
-    '.mpp',  # Project
+# 不需要下载的扩展名（这些在 PDF 中已经可见）
+# 只有图片格式会被内联渲染到 PDF/网页中，其他所有格式都需要下载才能查看
+SKIP_EXTENSIONS = {
+    '.png', '.jpg', '.jpeg', '.gif', '.svg', '.bmp', '.ico', '.webp',
 }
 
 
@@ -85,7 +82,7 @@ def get_downloadable_attachments(page_data: dict) -> list:
         filename = att.get("title", "")
         ext = os.path.splitext(filename)[1].lower()
         # 排除图片（图片已在 PDF 中内嵌）
-        if ext in {'.png', '.jpg', '.jpeg', '.gif', '.svg', '.bmp', '.ico', '.webp'}:
+        if ext in SKIP_EXTENSIONS:
             continue
         download_link = att.get("_links", {}).get("download", "")
         if download_link:
@@ -107,7 +104,7 @@ def get_downloadable_attachments(page_data: dict) -> list:
         for filename in viewfile_refs:
             if filename not in existing_names:
                 ext = os.path.splitext(filename)[1].lower()
-                if ext not in {'.png', '.jpg', '.jpeg', '.gif', '.svg', '.bmp', '.ico', '.webp'}:
+                if ext not in SKIP_EXTENSIONS:
                     attachments.append({
                         "filename": filename,
                         "download_link": "",  # 需要从 attachment API 获取
