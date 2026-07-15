@@ -20,6 +20,18 @@ CONFLUENCE_PASSWORD = os.getenv("CONFLUENCE_PASSWORD", "")
 OUTPUT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
+def safe_filename(name: str) -> str:
+    """将字符串转为安全的文件名，去除所有特殊字符和控制字符"""
+    # 先替换控制字符和空白字符
+    name = re.sub(r'[\x00-\x1f\x7f]', '', name)
+    # 再替换文件系统不允许的字符
+    name = re.sub(r'[<>:"/\\|?*]', '_', name)
+    # 去除首尾空白
+    name = name.strip()
+    # 限制长度
+    return name[:80] if name else "untitled"
+
+
 def get_session():
     """创建带 Basic Auth 的请求会话"""
     session = requests.Session()
@@ -59,7 +71,7 @@ def download_attachment(session, attachment: dict, page_title: str) -> str:
     if not download_link:
         return ""
     filename = attachment.get("title", "attachment")
-    safe_title = re.sub(r'[<>:"/\\|?*]', "_", page_title)
+    safe_title = safe_filename(page_title)
     att_dir = os.path.join(OUTPUT_DIR, "downloads", safe_title)
     os.makedirs(att_dir, exist_ok=True)
     local_path = os.path.join(att_dir, filename)
@@ -184,8 +196,12 @@ def build_full_html(title: str, body_html: str) -> str:
 <meta charset="utf-8">
 <title>{title}</title>
 <style>
+    @font-face {{
+        font-family: 'SimHei';
+        src: url('C:/Windows/Fonts/simhei.ttf');
+    }}
     body {{
-        font-family: "Microsoft YaHei", "SimSun", Arial, sans-serif;
+        font-family: SimHei;
         font-size: 14px;
         line-height: 1.6;
         color: #333;
@@ -195,6 +211,7 @@ def build_full_html(title: str, body_html: str) -> str:
     }}
     h1 {{
         font-size: 22px;
+        font-family: SimHei;
         color: #172b4d;
         border-bottom: 2px solid #0052cc;
         padding-bottom: 6px;
@@ -202,6 +219,7 @@ def build_full_html(title: str, body_html: str) -> str:
     }}
     h2 {{
         font-size: 18px;
+        font-family: SimHei;
         color: #172b4d;
         margin-top: 22px;
     }}
@@ -216,6 +234,7 @@ def build_full_html(title: str, body_html: str) -> str:
         padding: 8px 10px;
         text-align: left;
         vertical-align: top;
+        font-family: SimHei;
     }}
     th {{
         background-color: #f4f5f7;
@@ -241,6 +260,7 @@ def build_full_html(title: str, body_html: str) -> str:
         background-color: #ebecf0;
         padding: 6px 12px;
         font-size: 12px;
+        font-family: SimHei;
         color: #6b778c;
         border: 1px solid #dfe1e6;
         border-bottom: none;
@@ -256,6 +276,7 @@ def build_full_html(title: str, body_html: str) -> str:
     }}
     .task-item {{
         margin: 3px 0;
+        font-family: SimHei;
     }}
     .task-item input[type="checkbox"] {{
         margin-right: 6px;
@@ -293,8 +314,10 @@ def crawl_and_generate_pdfs(limit: int = 3) -> list:
     if not all([CONFLUENCE_BASE_URL, CONFLUENCE_USERNAME, CONFLUENCE_PASSWORD]):
         raise ValueError("请在 .env 文件中填写完整的 Confluence 配置信息")
 
-    from xhtml2pdf import pisa
-    import io
+    from fpdf import FPDF
+
+    # 中文字体路径
+    font_path = "C:/Windows/Fonts/simhei.ttf"
 
     session = get_session()
     print(f"[INFO] 正在从 Confluence 获取所有 Space 下最近 {limit} 条更新的页面...")
@@ -336,26 +359,313 @@ def crawl_and_generate_pdfs(limit: int = 3) -> list:
         # 清洗 HTML
         clean_html = clean_confluence_html(body_html, downloaded_images)
 
-        # 构建完整 HTML
-        full_html = build_full_html(page_title, clean_html)
-
         # 保存 HTML（方便调试）
-        safe_title = re.sub(r'[<>:"/\\|?*]', "_", page_title)
+        safe_title = safe_filename(page_title)
         html_path = os.path.join(OUTPUT_DIR, f"{safe_title}.html")
+        debug_html = build_full_html(page_title, clean_html)
         with open(html_path, "w", encoding="utf-8") as f:
-            f.write(full_html)
+            f.write(debug_html)
 
         # 生成 PDF
         pdf_path = os.path.join(OUTPUT_DIR, f"{safe_title}.pdf")
-        with open(pdf_path, "wb") as pdf_file:
-            pisa_status = pisa.CreatePDF(io.StringIO(full_html), dest=pdf_file, encoding="utf-8")
-
-        if pisa_status.err:
-            print(f"  [PDF] 生成有警告，但已保存: {pdf_path}")
-        else:
+        try:
+            generate_pdf_with_fpdf2(pdf_path, page_title, clean_html, downloaded_images, font_path)
             print(f"  [PDF] 已生成: {pdf_path}")
+            pdf_paths.append(pdf_path)
+        except Exception as e:
+            print(f"  [PDF] 生成失败: {e}")
 
-        pdf_paths.append(pdf_path)
         print()
 
     return pdf_paths
+
+
+def generate_pdf_with_fpdf2(pdf_path: str, title: str, body_html: str, images: dict, font_path: str):
+    """使用 fpdf2 生成 PDF，支持中文和图片"""
+    from fpdf import FPDF
+
+    pdf = FPDF(orientation='P', unit='mm', format='A4')
+    pdf.set_auto_page_break(auto=True, margin=15)
+
+    # 注册中文字体
+    pdf.add_font("SimHei", "", font_path)
+    pdf.add_font("SimHei", "B", font_path)  # 黑体本身较粗，用作 bold
+
+    pdf.add_page()
+
+    # 标题
+    pdf.set_font("SimHei", "B", 18)
+    pdf.cell(0, 12, title, new_x="LMARGIN", new_y="NEXT", align="C")
+    pdf.ln(4)
+    # 标题下划线
+    pdf.set_draw_color(0, 82, 204)
+    pdf.set_line_width(0.5)
+    pdf.line(10, pdf.get_y(), 200, pdf.get_y())
+    pdf.ln(6)
+
+    # 解析 HTML 并渲染
+    _render_html_to_pdf(pdf, body_html, images)
+
+    pdf.output(pdf_path)
+
+
+def _render_html_to_pdf(pdf, html: str, images: dict):
+    """将清洗后的 HTML 渲染到 PDF 中"""
+    from html.parser import HTMLParser
+    import html as html_module
+
+    class ConfluencePDFRenderer(HTMLParser):
+        def __init__(self, pdf, images):
+            super().__init__()
+            self.pdf = pdf
+            self.images = images
+            self.current_tag = ""
+            self.tag_stack = []
+            self.in_table = False
+            self.in_row = False
+            self.in_header = False
+            self.current_row_cells = []
+            self.current_cell_text = ""
+            self.table_headers = []
+            self.col_count = 0
+            self.in_pre = False
+            self.pre_text = ""
+            self.in_li = False
+            self.li_text = ""
+            self.in_h1 = False
+            self.in_h2 = False
+            self.in_h3 = False
+            self.in_bold = False
+            self.in_checkbox = False
+            self.checkbox_checked = False
+
+        def _set_normal_font(self):
+            style = "B" if self.in_bold else ""
+            self.pdf.set_font("SimHei", style, 10)
+
+        def handle_starttag(self, tag, attrs):
+            tag = tag.lower()
+            self.tag_stack.append(tag)
+            self.current_tag = tag
+            attrs_dict = dict(attrs)
+
+            if tag == "h1":
+                self.in_h1 = True
+                self.pdf.ln(4)
+                self.pdf.set_font("SimHei", "B", 16)
+                self.pdf.set_text_color(23, 43, 77)
+            elif tag == "h2":
+                self.in_h2 = True
+                self.pdf.ln(3)
+                self.pdf.set_font("SimHei", "B", 14)
+                self.pdf.set_text_color(23, 43, 77)
+            elif tag == "h3":
+                self.in_h3 = True
+                self.pdf.ln(2)
+                self.pdf.set_font("SimHei", "B", 12)
+                self.pdf.set_text_color(23, 43, 77)
+            elif tag == "strong" or tag == "b":
+                self.in_bold = True
+                self._set_normal_font()
+            elif tag == "p":
+                self._set_normal_font()
+                self.pdf.set_text_color(51, 51, 51)
+                self.pdf.ln(2)
+            elif tag == "br":
+                self.pdf.ln(4)
+            elif tag == "table":
+                self.in_table = True
+                self.table_headers = []
+                self.col_count = 0
+            elif tag == "tr":
+                self.in_row = True
+                self.current_row_cells = []
+                self.current_cell_text = ""
+            elif tag == "th":
+                self.in_header = True
+                self.current_cell_text = ""
+            elif tag == "td":
+                self.in_header = False
+                self.current_cell_text = ""
+            elif tag == "pre":
+                self.in_pre = True
+                self.pre_text = ""
+            elif tag == "code":
+                pass
+            elif tag == "li":
+                self.in_li = True
+                self.li_text = ""
+                # 检查是否有 checkbox
+                self.in_checkbox = False
+                self.checkbox_checked = False
+            elif tag == "input":
+                if attrs_dict.get("type") == "checkbox":
+                    self.in_checkbox = True
+                    self.checkbox_checked = "checked" in attrs_dict
+            elif tag == "img":
+                src = attrs_dict.get("src", "")
+                if src.startswith("data:"):
+                    # base64 图片
+                    try:
+                        import base64
+                        header, data = src.split(",", 1)
+                        img_data = base64.b64decode(data)
+                        import tempfile
+                        tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+                        tmp.write(img_data)
+                        tmp.close()
+                        # 计算合适的大小
+                        max_w = 170
+                        try:
+                            from PIL import Image
+                            import io
+                            img = Image.open(io.BytesIO(img_data))
+                            w, h = img.size
+                            aspect = h / w if w > 0 else 1
+                            img_w = min(max_w, 170)
+                            img_h = img_w * aspect
+                            if img_h > 120:
+                                img_h = 120
+                                img_w = img_h / aspect
+                        except:
+                            img_w = 80
+                            img_h = 60
+                        self.pdf.image(tmp.name, x=self.pdf.l_margin, w=img_w, h=img_h)
+                        self.pdf.ln(img_h + 2)
+                        os.unlink(tmp.name)
+                    except Exception as e:
+                        self.pdf.set_font("SimHei", "", 8)
+                        self.pdf.cell(0, 5, f"[图片加载失败]", new_x="LMARGIN", new_y="NEXT")
+
+        def handle_endtag(self, tag):
+            tag = tag.lower()
+            if self.tag_stack and self.tag_stack[-1] == tag:
+                self.tag_stack.pop()
+
+            if tag == "h1":
+                self.in_h1 = False
+                self.pdf.set_text_color(0, 0, 0)
+                self.pdf.ln(2)
+                # 画底线
+                self.pdf.set_draw_color(0, 82, 204)
+                self.pdf.set_line_width(0.3)
+                y = self.pdf.get_y()
+                self.pdf.line(10, y, 200, y)
+                self.pdf.ln(4)
+            elif tag == "h2":
+                self.in_h2 = False
+                self.pdf.set_text_color(0, 0, 0)
+                self.pdf.ln(2)
+            elif tag == "h3":
+                self.in_h3 = False
+                self.pdf.set_text_color(0, 0, 0)
+                self.pdf.ln(2)
+            elif tag == "strong" or tag == "b":
+                self.in_bold = False
+                self._set_normal_font()
+            elif tag == "p":
+                self.pdf.ln(2)
+            elif tag == "table":
+                self.in_table = False
+                self.pdf.ln(3)
+            elif tag == "tr":
+                self.in_row = False
+                if self.current_row_cells:
+                    try:
+                        if not self.table_headers and self.col_count == 0:
+                            # 第一行作为表头
+                            self.table_headers = self.current_row_cells
+                            self.col_count = len(self.current_row_cells)
+                            # 计算列宽，确保足够空间
+                            col_w = 180 / max(self.col_count, 1)
+                            font_size = max(5, min(9, int(col_w / 2.5)))
+                            self.pdf.set_fill_color(244, 245, 247)
+                            self.pdf.set_font("SimHei", "B", font_size)
+                            for cell in self.current_row_cells:
+                                text = cell.strip()[:20]
+                                self.pdf.cell(col_w, 7, text, border=1, fill=True)
+                            self.pdf.ln()
+                        else:
+                            if self.col_count == 0:
+                                self.col_count = len(self.current_row_cells)
+                            col_w = 180 / max(self.col_count, 1)
+                            font_size = max(5, min(9, int(col_w / 2.5)))
+                            self.pdf.set_font("SimHei", "", font_size)
+                            for j, cell in enumerate(self.current_row_cells):
+                                text = cell.strip()
+                                max_chars = max(2, int(col_w / 2))
+                                if len(text) > max_chars:
+                                    text = text[:max_chars-1] + ".."
+                                self.pdf.cell(col_w, 7, text, border=1)
+                            self.pdf.ln()
+                    except Exception:
+                        # 列太密无法渲染，跳过该行
+                        pass
+            elif tag == "th" or tag == "td":
+                self.current_row_cells.append(self.current_cell_text)
+                self.current_cell_text = ""
+            elif tag == "pre":
+                self.in_pre = False
+                self.pdf.set_font("SimHei", "", 8)
+                self.pdf.set_fill_color(244, 245, 247)
+                self.pdf.set_draw_color(200, 200, 200)
+                # 限制代码块高度
+                lines = self.pre_text.strip().split("\n")
+                for line in lines[:30]:  # 最多显示30行
+                    self.pdf.cell(0, 5, "  " + line[:100], border=0, fill=True, new_x="LMARGIN", new_y="NEXT")
+                self.pdf.ln(2)
+                self.pre_text = ""
+            elif tag == "li":
+                self.in_li = False
+                self._set_normal_font()
+                prefix = ""
+                if self.in_checkbox:
+                    prefix = "[v] " if self.checkbox_checked else "[ ] "
+                else:
+                    prefix = "  - "
+                self.pdf.cell(0, 5, prefix + self.li_text.strip(), new_x="LMARGIN", new_y="NEXT")
+            elif tag == "ul":
+                self.pdf.ln(1)
+
+        def handle_data(self, data):
+            text = data.strip()
+            if not text:
+                return
+
+            if self.in_pre:
+                self.pre_text += data
+            elif self.in_li:
+                self.li_text += text
+            elif self.in_table:
+                self.current_cell_text += text
+            elif self.in_h1 or self.in_h2 or self.in_h3:
+                self._set_normal_font()
+                self.pdf.set_text_color(23, 43, 77)
+                self.pdf.cell(0, 8, text, new_x="LMARGIN", new_y="NEXT")
+            else:
+                self._set_normal_font()
+                self.pdf.set_text_color(51, 51, 51)
+                # 处理普通段落文本
+                try:
+                    self.pdf.multi_cell(0, 5, text)
+                except Exception:
+                    pass
+
+        def handle_entityref(self, name):
+            char = html_module.unescape(f"&{name};")
+            self._handle_char(char)
+
+        def handle_charref(self, name):
+            char = html_module.unescape(f"&#{name};")
+            self._handle_char(char)
+
+        def _handle_char(self, char):
+            if self.in_pre:
+                self.pre_text += char
+            elif self.in_li:
+                self.li_text += char
+            elif self.in_table:
+                self.current_cell_text += char
+
+    renderer = ConfluencePDFRenderer(pdf, images)
+    renderer.feed(html)
