@@ -98,17 +98,39 @@ def list_knowledge_bases() -> list:
     return _extract_data(resp.json())
 
 
-def upload_file(knowledge_base_id: str, file_path: str) -> dict:
+# 最轻量 process_config：关闭所有耗时功能，仅做基础分块 + 向量化
+_LIGHTWEIGHT_PROCESS_CONFIG = {
+    "enable_multimodel": False,          # 关闭图文多模态
+    "vlm_config": {"enabled": False},    # 关闭 VLM 视觉语言模型
+    "asr_config": {"enabled": False},    # 关闭语音识别
+    "question_generation_config": {"enabled": False},  # 关闭自动生成问题
+    "graph_enabled": False,              # 关闭知识图谱抽取
+    "chunking_config": {
+        "chunk_size": 500,               # 小 chunk，处理快
+        "chunk_overlap": 50,             # 最小 overlap
+    },
+}
+
+
+def upload_file(knowledge_base_id: str, file_path: str,
+                process_config: dict | None = _LIGHTWEIGHT_PROCESS_CONFIG) -> dict:
     """
     上传文件到指定知识库
+    process_config 默认使用最轻量配置（关闭多模态/图谱/问题生成等），
+    传 None 则使用知识库自身默认配置。
     返回包含 knowledge_id 等信息的响应
     """
+    import json as _json
+
     url = f"{WEKNORA_BASE_URL}/api/v1/knowledge-bases/{knowledge_base_id}/knowledge/file"
     filename = os.path.basename(file_path)
 
     with open(file_path, "rb") as f:
         files = {"file": (filename, f)}
-        resp = requests.post(url, files=files, headers=_headers())
+        data = {}
+        if process_config is not None:
+            data["process_config"] = _json.dumps(process_config)
+        resp = requests.post(url, files=files, data=data, headers=_headers())
 
     resp.raise_for_status()
     result = _extract_data(resp.json())

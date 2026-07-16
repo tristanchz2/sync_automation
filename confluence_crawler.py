@@ -19,6 +19,20 @@ CONFLUENCE_PASSWORD = os.getenv("CONFLUENCE_PASSWORD", "")
 
 OUTPUT_DIR = os.path.dirname(os.path.abspath(__file__))
 
+
+def normalize_last_modified(iso_str: str) -> str:
+    """
+    将 Confluence 返回的 ISO 8601 时间（如 2026-07-16T11:25:00.000+08:00）
+    转为 yyyy-MM-dd HH:mm 格式，与 DB / LAST_SYNC_TIME 保持一致。
+    """
+    if not iso_str:
+        return ""
+    try:
+        # 取前16位: "2026-07-16T11:25" → 替换T为空格 → "2026-07-16 11:25"
+        return iso_str[:16].replace("T", " ")
+    except Exception:
+        return iso_str
+
 # 不需要下载的扩展名（这些在 PDF 中已经可见）
 # 只有图片格式会被内联渲染到 PDF/网页中，其他所有格式都需要下载才能查看
 SKIP_EXTENSIONS = {
@@ -275,59 +289,59 @@ def _process_page(session, page_id: str, page_title: str, space_name: str,
     except Exception as e:
         print(f"  [PDF] 导出失败: {e}")
 
-    # 2. 识别并下载附件
-    try:
-        page_data = get_page_detail(session, page_id)
-        attachments = get_downloadable_attachments(page_data)
+    # # 2. 识别并下载附件
+    # try:
+    #     page_data = get_page_detail(session, page_id)
+    #     attachments = get_downloadable_attachments(page_data)
 
-        if attachments:
-            print(f"  [附件] 发现 {len(attachments)} 个可下载文件:")
-            for att in attachments:
-                filename = att["filename"]
-                size_kb = att["size"] / 1024 if att["size"] else 0
-                print(f"    - {filename} ({size_kb:.0f} KB)")
-                try:
-                    local_path = download_attachment(session, page_id, att, page_dir)
-                    if local_path:
-                        page_result["attachments"].append({
-                            "filename": filename,
-                            "local_path": local_path,
-                            "size": os.path.getsize(local_path),
-                        })
-                        print(f"      [已下载]")
-                    else:
-                        print(f"      [下载失败: 无法获取下载链接]")
-                except Exception as e:
-                    print(f"      [下载失败: {e}]")
-        else:
-            print(f"  [附件] 无需要下载的附件")
-    except Exception as e:
-        print(f"  [附件] 获取附件列表失败: {e}")
+    #     if attachments:
+    #         print(f"  [附件] 发现 {len(attachments)} 个可下载文件:")
+    #         for att in attachments:
+    #             filename = att["filename"]
+    #             size_kb = att["size"] / 1024 if att["size"] else 0
+    #             print(f"    - {filename} ({size_kb:.0f} KB)")
+    #             try:
+    #                 local_path = download_attachment(session, page_id, att, page_dir)
+    #                 if local_path:
+    #                     page_result["attachments"].append({
+    #                         "filename": filename,
+    #                         "local_path": local_path,
+    #                         "size": os.path.getsize(local_path),
+    #                     })
+    #                     print(f"      [已下载]")
+    #                 else:
+    #                     print(f"      [下载失败: 无法获取下载链接]")
+    #             except Exception as e:
+    #                 print(f"      [下载失败: {e}]")
+    #     else:
+    #         print(f"  [附件] 无需要下载的附件")
+    # except Exception as e:
+    #     print(f"  [附件] 获取附件列表失败: {e}")
 
     results = [page_result]
 
-    # 3. 递归下载子页面
-    try:
-        child_pages = get_child_pages(session, page_id)
-        if child_pages:
-            print(f"  [子页面] 发现 {len(child_pages)} 个子页面，递归下载...")
-            for child in child_pages:
-                child_id = child["id"]
-                if child_id in visited:
-                    continue
-                child_title = child.get("title", "N/A")
-                child_space = child.get("space", {}).get("name", space_name)
-                child_space_key = child.get("space", {}).get("key", space_key)
-                child_space_id = child.get("space", {}).get("id", space_id)
-                child_modified = child.get("version", {}).get("when", "")
-                print()
-                child_results = _process_page(
-                    session, child_id, child_title, child_space,
-                    child_modified, visited, child_space_key, child_space_id
-                )
-                results.extend(child_results)
-    except Exception as e:
-        print(f"  [子页面] 获取子页面失败: {e}")
+    # # 3. 递归下载子页面
+    # try:
+    #     child_pages = get_child_pages(session, page_id)
+    #     if child_pages:
+    #         print(f"  [子页面] 发现 {len(child_pages)} 个子页面，递归下载...")
+    #         for child in child_pages:
+    #             child_id = child["id"]
+    #             if child_id in visited:
+    #                 continue
+    #             child_title = child.get("title", "N/A")
+    #             child_space = child.get("space", {}).get("name", space_name)
+    #             child_space_key = child.get("space", {}).get("key", space_key)
+    #             child_space_id = child.get("space", {}).get("id", space_id)
+    #             child_modified = child.get("version", {}).get("when", "")
+    #             print()
+    #             child_results = _process_page(
+    #                 session, child_id, child_title, child_space,
+    #                 child_modified, visited, child_space_key, child_space_id
+    #             )
+    #             results.extend(child_results)
+    # except Exception as e:
+    #     print(f"  [子页面] 获取子页面失败: {e}")
 
     return results
 
@@ -414,7 +428,7 @@ def download_single_page(page_input: str) -> list:
     page_id = page_info["id"]
     page_title = page_info.get("title", "N/A")
     space_name = page_info.get("space", {}).get("name", "未知空间")
-    last_modified = page_info.get("version", {}).get("when", "")
+    last_modified = normalize_last_modified(page_info.get("version", {}).get("when", ""))
 
     print(f"[INFO] 找到页面: {page_title} (ID: {page_id})\n")
 
@@ -477,7 +491,7 @@ def get_latest_pages(limit: int = 50) -> list:
                 "space_key": page.get("space", {}).get("key", ""),
                 "space_id": page.get("space", {}).get("id", 0),
                 "space_name": page.get("space", {}).get("name", ""),
-                "last_modified": page.get("version", {}).get("when", ""),
+                "last_modified": normalize_last_modified(page.get("version", {}).get("when", "")),
             }
             all_pages.append(page_info)
 
@@ -542,7 +556,7 @@ def get_recently_changed_pages(since: str, limit: int = 100) -> list:
                 "space_key": page.get("space", {}).get("key", ""),
                 "space_id": page.get("space", {}).get("id", 0),
                 "space_name": page.get("space", {}).get("name", ""),
-                "last_modified": page.get("version", {}).get("when", ""),
+                "last_modified": normalize_last_modified(page.get("version", {}).get("when", "")),
             }
             all_pages.append(page_info)
 
