@@ -442,6 +442,102 @@ def download_single_page(page_input: str) -> list:
     return results
 
 
+def get_trashed_pages_by_space(space_key: str) -> list:
+    """
+    查询指定 space 中所有在回收站里的页面。
+    使用 Confluence REST API: /rest/api/content?spaceKey=xxx&status=trashed&type=page
+    自动处理分页。
+
+    返回:
+        list of dict，每个包含:
+          - id: 页面 ID
+          - title: 页面标题
+    """
+    if not all([CONFLUENCE_BASE_URL, CONFLUENCE_USERNAME, CONFLUENCE_PASSWORD]):
+        raise ValueError("请在 .env 文件中填写完整的 Confluence 配置信息")
+
+    session = get_session()
+    url = f"{CONFLUENCE_BASE_URL}/rest/api/content"
+    all_trashed = []
+    start = 0
+
+    while True:
+        params = {
+            "spaceKey": space_key,
+            "status": "trashed",
+            "type": "page",
+            "limit": 100,
+            "start": start,
+        }
+        try:
+            resp = session.get(url, params=params)
+            resp.raise_for_status()
+            data = resp.json()
+            results = data.get("results", [])
+            for page in results:
+                all_trashed.append({
+                    "id": page["id"],
+                    "title": page.get("title", ""),
+                })
+            # 分页
+            if data.get("_links", {}).get("next"):
+                start += len(results)
+            else:
+                break
+        except Exception as e:
+            print(f"  [警告] 查询 space '{space_key}' 回收站失败: {e}")
+            break
+
+    return all_trashed
+
+
+def check_trashed_by_ids(page_ids: list) -> list:
+    """
+    批量检查指定的 page ID 中哪些已进入回收站。
+    使用 CQL 搜索: id in (...) AND status = trashed
+    每批最多查 20 个 ID，避免 CQL 过长。
+
+    返回:
+        list of dict，每个包含:
+          - id: 页面 ID
+          - title: 页面标题
+    """
+    if not page_ids:
+        return []
+
+    if not all([CONFLUENCE_BASE_URL, CONFLUENCE_USERNAME, CONFLUENCE_PASSWORD]):
+        raise ValueError("请在 .env 文件中填写完整的 Confluence 配置信息")
+
+    session = get_session()
+    url = f"{CONFLUENCE_BASE_URL}/rest/api/content/search"
+    trashed = []
+    batch_size = 20
+
+    for i in range(0, len(page_ids), batch_size):
+        batch = page_ids[i:i + batch_size]
+        # 构建 CQL: (id = "1" OR id = "2" OR ...) AND status = trashed
+        id_clauses = " OR ".join(f'id = "{pid}"' for pid in batch)
+        cql = f'({id_clauses}) AND status = trashed'
+
+        try:
+            params = {
+                "cql": cql,
+                "limit": len(batch),
+            }
+            resp = session.get(url, params=params)
+            resp.raise_for_status()
+            data = resp.json()
+            for page in data.get("results", []):
+                trashed.append({
+                    "id": page["id"],
+                    "title": page.get("title", ""),
+                })
+        except Exception as e:
+            print(f"  [警告] 批量检查 trashed 状态失败 (batch {i // batch_size + 1}): {e}")
+
+    return trashed
+
+
 def get_latest_pages(limit: int = 50) -> list:
     """
     获取 Confluence 中最近修改的页面（仅 current 状态），按 lastModified 倒序。

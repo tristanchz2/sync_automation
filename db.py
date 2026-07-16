@@ -139,6 +139,42 @@ def save_kb_mapping(space_id: int, space_key: str, space_name: str,
     conn.close()
 
 
+def get_all_space_keys() -> list:
+    """获取所有已记录的 space_key 列表"""
+    conn = get_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute("SELECT space_key FROM knowledge_bases")
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return [row["space_key"] for row in rows]
+
+
+def get_synced_page_ids_by_space() -> dict:
+    """
+    按 space_key 分组获取所有已同步的 page_id。
+    返回: {space_key: [page_id, page_id, ...], ...}
+    """
+    conn = get_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute("""
+        SELECT kb.space_key, pm.confluence_page_id
+        FROM page_mappings pm
+        JOIN knowledge_bases kb ON pm.knowledge_base_id = kb.knowledge_base_id
+    """)
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    result = {}
+    for row in rows:
+        sk = row["space_key"]
+        if sk not in result:
+            result[sk] = []
+        result[sk].append(row["confluence_page_id"])
+    return result
+
+
 # ─────────────────────────────────────────────
 # page_mappings 表操作（page → knowledge）
 # ─────────────────────────────────────────────

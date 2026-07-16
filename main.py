@@ -14,11 +14,12 @@ from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
-from confluence_crawler import download_single_page, get_recently_changed_pages, get_latest_pages
+from confluence_crawler import download_single_page, get_recently_changed_pages, get_latest_pages, get_trashed_pages_by_space
 from weknora_client import create_knowledge_base, upload_file, delete_knowledge
 from db import (
     init_db, get_kb_by_space, save_kb_mapping,
     get_page_mapping, save_page_mapping, delete_page_mapping,
+    get_all_space_keys,
 )
 
 
@@ -105,9 +106,11 @@ def sync_page_to_weknora(page_result: dict):
         print(f"[更新] 发现旧映射: knowledge_id={old_knowledge_id}，正在删除旧知识...")
         try:
             delete_knowledge(old_kb_id, old_knowledge_id)
+            print(f"[更新] 旧知识已删除: knowledge_id={old_knowledge_id}")
+            # WeKnora 删除成功后才删 DB 记录，避免产生孤儿数据
+            delete_page_mapping(page_id)
         except Exception as e:
-            print(f"[警告] 删除旧知识失败: {e}（将继续上传）")
-        delete_page_mapping(page_id)
+            print(f"[警告] 删除旧知识失败: {e}，保留 DB 记录等待下次重试")
 
     # 3. 上传 PDF 到 WeKnora
     print(f"[上传] 正在上传 PDF 到知识库 {kb_id}...")
@@ -270,16 +273,84 @@ def run_sync():
     print(f"{'='*60}")
 
 
+def cleanup_trashed_pages():
+    """
+    清理回收站中的页面：
+    遍历 DB 中所有 space_key，查询 Confluence 回收站，
+    若 DB 中有映射的页面已在回收站，则从 WeKnora 和 DB 中同步删除。
+    """
+    space_keys = get_all_space_keys()
+    if not space_keys:
+        print("[清理] DB 中无已记录的 space，跳过回收站清理")
+        return 0
+
+    total_deleted = 0
+
+    for space_key in space_keys:
+        print(f"\n[清理] 正在检查 space '{space_key}' 的回收站...")
+        try:
+            trashed_pages = get_trashed_pages_by_space(space_key)
+        except Exception as e:
+            print(f"  [错误] 查询 space '{space_key}' 回收站失败: {e}")
+            continue
+
+        if not trashed_pages:
+            print(f"  [清理] space '{space_key}' 回收站为空")
+            continue
+
+        print(f"  [清理] 发现 {len(trashed_pages)} 个回收站页面")
+
+        for page_info in trashed_pages:
+            page_id = str(page_info["id"])
+            page_title = page_info.get("title", "")
+
+            # 查询 DB 中是否有该页面的映射
+            mapping = get_page_mapping(page_id)
+            if not mapping:
+                # DB 中没有记录，无需处理
+                continue
+
+            kb_id = mapping["knowledge_base_id"]
+            knowledge_id = mapping["knowledge_id"]
+
+            print(f"  [删除] 页面 '{page_title}' (ID: {page_id}) 已在回收站，正在清理...")
+
+            # 1. 从 WeKnora 删除知识
+            # 2. WeKnora 成功后才删 DB，避免产生孤儿数据
+            try:
+                delete_knowledge(kb_id, knowledge_id)
+                print(f"    [WeKnora] 知识已删除: knowledge_id={knowledge_id}")
+                delete_page_mapping(page_id)
+                print(f"    [DB] 映射已删除: page_id={page_id}")
+                total_deleted += 1
+            except Exception as e:
+                print(f"    [WeKnora] 删除失败 (knowledge_id={knowledge_id}): {e}，保留 DB 记录等待下次重试")
+
+    return total_deleted
+
+
 def run_pull():
     """
     拉取同步模式：
-    1. 从 Confluence 获取最近 N 条页面（按 lastModified 倒序）
-    2. 逐条比对：
-       - 已在本轮同步过（如被递归子页面顺带同步）→ 跳过继续
+    1. 先清理回收站：遍历所有 space，删除已进入回收站的页面
+    2. 从 Confluence 获取最近 N 条页面（按 lastModified 倒序）
+    3. 逐条比对：
+       - 已在本轮同步过 → 跳过
        - DB 无记录 或 last_modified 不同 → 同步
        - last_modified 一致（且非本轮同步的）→ 已同步到此处，结束
     """
+    # 第一步：清理回收站
+    print(f"\n{'#'*60}")
+    print(f"  第一步：回收站清理")
+    print(f"{'#'*60}")
+    deleted_count = cleanup_trashed_pages()
+    print(f"\n[清理] 共清理 {deleted_count} 个回收站页面")
+
+    # 第二步：拉取同步
     pull_limit = int(os.getenv("PULL_LIMIT", "50"))
+    print(f"\n{'#'*60}")
+    print(f"  第二步：拉取同步（最近 {pull_limit} 条）")
+    print(f"{'#'*60}")
     print(f"[拉取] 正在获取 Confluence 最近 {pull_limit} 条页面...")
     try:
         latest_pages = get_latest_pages(limit=pull_limit)
@@ -330,7 +401,9 @@ def run_pull():
             print(f"[ERROR] 同步页面 '{page_title}' (ID: {page_id}) 失败: {e}")
 
     print(f"\n{'='*60}")
-    print(f"  拉取同步完成: 共同步 {len(synced_ids)} 个页面")
+    print(f"  拉取同步完成")
+    print(f"  - 回收站清理: {deleted_count} 个页面已删除")
+    print(f"  - 新增/更新: 共同步 {len(synced_ids)} 个页面")
     print(f"{'='*60}")
 
 
